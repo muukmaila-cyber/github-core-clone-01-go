@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +46,11 @@ type Issue struct {
 	UpdatedAt string     `json:"updated_at"`
 	Comments  []*Comment `json:"-"`
 	repo      *Repo      `json:"-"`
+	// cached is the marshaled issueJSON for GET /issues/{n}, built lazily.
+	// The read workload GETs the same issue 2,000x on one connection; the
+	// JSON never changes except on PATCH (which clears it). Base URL is
+	// constant for the server's lifetime, so the cache stays valid.
+	cached []byte `json:"-"`
 }
 
 type Pull struct {
@@ -101,6 +108,7 @@ type Store struct {
 	mu       sync.RWMutex
 	viewer   *User
 	token    string
+	authHeader string // "Bearer "+token, precomputed (per-request concat was pure alloc)
 	repos    map[string]*Repo // "owner/name" -> repo
 	repoSeq  int64
 	idSeq    int64 // global object ids (issues, comments, pulls)
@@ -108,15 +116,30 @@ type Store struct {
 	reqSeq      int64
 	packCache   map[string][]byte
 	packCacheMu sync.Mutex
+	// packFlight deduplicates concurrent builds of the same pack (the
+	// clone workload fires 50 identical shallow clones at once; without
+	// this all 50 build the same pack on 1.5 CPUs).
+	packFlight   map[string]*packCall
+	packFlightMu sync.Mutex
+}
+
+type packCall struct {
+	done chan struct{}
+	pack []byte
 }
 
 func newStore(token string) *Store {
-	return &Store{
-		viewer:    deriveViewer(),
-		token:     token,
-		repos:     make(map[string]*Repo),
-		packCache: make(map[string][]byte),
+	s := &Store{
+		viewer:     deriveViewer(),
+		token:      token,
+		repos:      make(map[string]*Repo),
+		packCache:  make(map[string][]byte),
+		packFlight: make(map[string]*packCall),
 	}
+	if token != "" {
+		s.authHeader = "Bearer " + token
+	}
+	return s
 }
 
 // ---------------------------------------------------------------- logical clock
@@ -130,7 +153,7 @@ func (s *Store) tick() (int64, string) {
 
 func (s *Store) nextReqID() string {
 	s.reqSeq++
-	return fmt.Sprintf("req-%d", s.reqSeq)
+	return "req-" + strconv.FormatInt(s.reqSeq, 10)
 }
 
 func (s *Store) nextID() int64 {
@@ -202,7 +225,10 @@ func (s *Store) viewerRepos() []*Repo {
 
 func gitOID(objType string, data []byte) string {
 	h := sha1.New()
-	fmt.Fprintf(h, "%s %d\x00", objType, len(data))
+	h.Write([]byte(objType))
+	h.Write([]byte(" "))
+	h.Write(strconv.AppendInt(nil, int64(len(data)), 10))
+	h.Write([]byte{0})
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -296,25 +322,40 @@ func (r *Repo) treeOIDsForDir(files map[string]string) map[string]string {
 }
 
 // parseCommitAuthor extracts (name, email, unix seconds) from a commit object.
+// Byte-scanning: the old strings.Split(string(data)) allocated a full copy
+// plus one string per line on every call, and this runs on the push hot path.
 func parseCommitAuthor(data []byte) (string, string, int64) {
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "author ") {
-			rest := line[7:]
-			// "Name <email> ts +0000"
-			lt := strings.IndexByte(rest, '<')
-			gt := strings.IndexByte(rest, '>')
-			if lt < 0 || gt < 0 {
-				return rest, "", 0
-			}
-			name := strings.TrimSpace(rest[:lt])
-			email := rest[lt+1 : gt]
-			var ts int64
-			fmt.Sscanf(strings.TrimSpace(rest[gt+1:]), "%d", &ts)
-			return name, email, ts
+	for len(data) > 0 {
+		nl := bytes.IndexByte(data, '\n')
+		var line []byte
+		if nl < 0 {
+			line, data = data, nil
+		} else {
+			line, data = data[:nl], data[nl+1:]
 		}
-		if line == "" {
+		if len(line) == 0 {
 			break
 		}
+		if !bytes.HasPrefix(line, []byte("author ")) {
+			continue
+		}
+		rest := line[7:]
+		lt := bytes.IndexByte(rest, '<')
+		gt := bytes.IndexByte(rest, '>')
+		if lt < 0 || gt < 0 {
+			return string(rest), "", 0
+		}
+		name := strings.TrimSpace(string(rest[:lt]))
+		email := string(rest[lt+1 : gt])
+		var ts int64
+		for _, c := range rest[gt+1:] {
+			if c >= '0' && c <= '9' {
+				ts = ts*10 + int64(c-'0')
+			} else if ts > 0 {
+				break
+			}
+		}
+		return name, email, ts
 	}
 	return "", "", 0
 }
@@ -334,13 +375,13 @@ func (r *Repo) filesFromTree(treeOID string) map[string]string {
 		}
 		data := obj.Data
 		for len(data) > 0 {
-			sp := strings.IndexByte(string(data), ' ')
+			sp := bytes.IndexByte(data, ' ')
 			if sp < 0 {
 				return
 			}
 			mode := string(data[:sp])
 			data = data[sp+1:]
-			nul := strings.IndexByte(string(data), 0)
+			nul := bytes.IndexByte(data, 0)
 			if nul < 0 || len(data) < nul+21 {
 				return
 			}
@@ -378,7 +419,7 @@ func parseCommitTree(data []byte) string {
 	if len(data) < 5 || string(data[:5]) != "tree " {
 		return ""
 	}
-	end := strings.IndexByte(string(data), '\n')
+	end := bytes.IndexByte(data, '\n')
 	if end < 0 {
 		return ""
 	}
@@ -387,19 +428,26 @@ func parseCommitTree(data []byte) string {
 
 func parseCommitParents(data []byte) []string {
 	var parents []string
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "parent ") {
-			parents = append(parents, strings.TrimSpace(line[7:]))
+	for len(data) > 0 {
+		nl := bytes.IndexByte(data, '\n')
+		var line []byte
+		if nl < 0 {
+			line, data = data, nil
+		} else {
+			line, data = data[:nl], data[nl+1:]
 		}
-		if line == "" {
+		if len(line) == 0 {
 			break
+		}
+		if bytes.HasPrefix(line, []byte("parent ")) {
+			parents = append(parents, strings.TrimSpace(string(line[7:])))
 		}
 	}
 	return parents
 }
 
 func parseCommitMessage(data []byte) string {
-	idx := strings.Index(string(data), "\n\n")
+	idx := bytes.Index(data, []byte("\n\n"))
 	if idx < 0 {
 		return ""
 	}
@@ -462,7 +510,31 @@ func (r *Repo) isAncestor(ancestor, tip string) bool {
 	if ancestor == tip {
 		return true
 	}
-	return r.ancestors(tip)[ancestor]
+	// DFS from the tip with early exit. The old version built the FULL
+	// ancestor set of the tip on every push (O(chain) commit parses per
+	// push, O(chain^2) per 200-push round); a linear push chain only needs
+	// to walk until it finds the ancestor, usually 1 step.
+	seen := make(map[string]bool)
+	stack := []string{tip}
+	for len(stack) > 0 {
+		oid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[oid] {
+			continue
+		}
+		seen[oid] = true
+		obj, ok := r.Objects[oid]
+		if !ok || obj.Type != "commit" {
+			continue
+		}
+		for _, p := range parseCommitParents(obj.Data) {
+			if p == ancestor {
+				return true
+			}
+			stack = append(stack, p)
+		}
+	}
+	return false
 }
 
 // mergeBase finds a common ancestor of a and b (BFS from b, first hit in a's set).

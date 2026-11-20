@@ -42,13 +42,21 @@ func writeJSON(w http.ResponseWriter, status int, v any, s *Store) {
 	w.Write(data)
 }
 
-// ---------------------------------------------------------------- router + auth
+// writeRawJSON writes pre-marshaled JSON (the read workload's cached issue).
+func writeRawJSON(w http.ResponseWriter, status int, data []byte, s *Store) {
+	w.Header().Set("Content-Type", "application/json")
+	if s != nil {
+		w.Header().Set("X-GitHub-Request-Id", s.nextReqID())
+	}
+	w.WriteHeader(status)
+	w.Write(data)
+}
 
 func (s *Store) authorized(r *http.Request) bool {
 	if s.token == "" {
 		return true
 	}
-	return r.Header.Get("Authorization") == "Bearer "+s.token
+	return r.Header.Get("Authorization") == s.authHeader
 }
 
 func (s *Store) handler(w http.ResponseWriter, r *http.Request) {

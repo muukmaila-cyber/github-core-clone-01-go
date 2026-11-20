@@ -13,6 +13,9 @@ byte-for-byte, 0 nondeterministic, 0 timeout.
 | B | 20 Nov ~22:43 | + fetch-response cache + singleflight | 961 | 961 | 969 | 963.7 | 163.3 | 334.5 µs |
 | C | 20 Nov ~22:44 | same as B (repeat) | 958 | — | — | ~960 | ~158 | ~331 µs |
 | D | 20 Nov ~22:46 | cache reverted (keep label + incremental fixes) | 969 | 980 | 971 | 973.3 | 173.3 | 290.2 µs |
+| E | 20 Nov ~23:12 | iterasi 1: Sscanf→hex manual, pktLine manual, isAncestor DFS, parse byte-based, pack singleflight, issue-JSON cache, auth precompute, zlib writer pool | 983 | 981 | 980 | 981.3 | 181.3 | 259.9 µs |
+| F | 20 Nov ~23:18 | iterasi 2: GOMAXPROCS=2 + GC off | 977 | 976 | 975 | 976.0 | 176.0 | 282.5 µs |
+| G | 20 Nov ~23:20 | iterasi 2 REVERTED (= E) | 980 | 978 | 985 | 981.0 | 181.0 | 261.7 µs |
 
 ## What the numbers say
 
@@ -30,23 +33,66 @@ byte-for-byte, 0 nondeterministic, 0 timeout.
   so it was reverted to keep the code simpler and remove a staleness risk.
 - **D confirms A:** reverted build lands back in the 970s band
   (969/980/971), so the 976 mean is real, not a one-off.
+- **D → E (+6.5, 974.8 → 981.3):** hot-path optimization batch 1. Biggest
+  win: `isAncestor` used to build the FULL ancestor set per push
+  (O(chain²) per 200-push round); now a DFS with early exit (usually 1
+  step on a linear chain) — push 580 → 501 ms. `fmt.Sscanf` per pkt-line
+  and `fmt.Sprintf` per pkt-line replaced by manual hex; commit/tree
+  parsing switched from `strings.Split(string(data))` to byte scanning;
+  pack builds deduplicated across the 50 concurrent clones
+  (singleflight); GET-issue responses cached (the read workload GETs the
+  same issue 2,000x); auth header precomputed; pooled zlib writers.
+  Clone 122 → 99 ms, read 831 → 764 ms, write flat 119 → 120 ms.
+- **E → F (−5.3, 981.3 → 976.0):** GOMAXPROCS=2 + GC off REGRESSED.
+  Push 501 → 533 ms, clone 99 → 127 ms (read flat). Fewer P's serialize
+  the 50 concurrent clones; reverted.
+- **F → G (+5.0, 976.0 → 981.0):** revert confirmed — back to the E
+  band (980/978/985, best single trial 985). E+G combined mean: **981.2**
+  (perf 181.2, p50 ~261 µs). Trial-to-trial noise is ±3 points
+  (978–985); clone is the most volatile workload (rounds 89–172 ms).
+
+## Why 999 is blocked (measured, 20 Nov ~23:20 WIB)
+
+- Target 999 needs perf 199/200, i.e. per-workload: push ≤434 ms,
+  clone ≤71 ms, read ≤730 ms, write ≤92 ms. Now (E+G mean): push 506,
+  clone 103, read 758, write 118 ms — gaps −13%, −29%, −4%, −23%.
+- Micro-benchmark vs the standalone forge (Python client, unloaded VM):
+  read 0.135 ms/req vs a bare-root floor of 0.130 ms/req — server read
+  work is ~5 µs/req, already at the loopback floor. Write 0.173 ms/req
+  vs 0.130 floor — server write work ~43 µs/req. The kit's Node client
+  measures 0.38 ms/read and 0.60 ms/write: the remaining ~0.25–0.43
+  ms/req is the client's own undici + JSON + await cost on the shared
+  1.5-CPU VM, which no server change can move. Same for clone (client
+  does 3 HTTP exchanges + checksum per clone) and push (client-side git
+  exchange). Server CPU is now a small share of every workload's wall.
+- Server ceiling: host is 2.146× slower than this VM (v0.2.1: local p50
+  330.8 µs → server 709.8 µs). Local 981 → server estimate **926**
+  (perf 126). Even a hypothetical local 999 → server ~944. Matching
+  HyperForge v5's server 970 (p50 305.6 µs) needs local p50 ~143 µs vs
+  the current ~261 µs (−45%) — below what the kit client + loopback
+  floor allow for read/clone. Further server-side iterations are
+  expected to move ±0–3 points, inside the noise band.
 
 ## Reference points
 
 - v0.2.1 Node fallback: local 965 (perf 165, p50 330.8 µs); **server dev
   909** (perf 109, p50 709.8 µs), rank dev 9.171/10.838.
-- Rank-1 target (HyperForge v5): local 970 (perf 170, p50 305.6 µs).
-- This build, clean-run mean: **local 974.8** (perf ~174.7, p50 ~286 µs).
-  Best single trial: **980** (run D trial 1).
+- Rank-1 target (HyperForge v5): **server** 970 (perf 170, p50 305.6 µs).
+  (Earlier note calling it a local number was wrong: it is the
+  leaderboard/server dev score; matching it on server needs local p50
+  ~143 µs.)
+- This build, clean-run mean (E+G, 6 trials): **local 981.2**
+  (perf ~181.2, p50 ~261 µs). Server estimate **~926**.
+  Best single trial: **985** (run G trial 2).
 
-## Per-workload local p50 (ms, mean of the 6 clean trials A+D)
+## Per-workload local p50 (ms, mean of the 6 clean trials E+G)
 
-| Workload | p50 mean | Points mean | T_ref |
-| --- | --- | --- | --- |
-| push | 580 | 44.0 | 1640.82 |
-| clone | 122 | 40.0 | 266.94 |
-| read | 831 | 46.2 | 2759.72 |
-| write | 119 | 44.5 | 348.97 |
+| Workload | p50 mean | Points mean | T_ref | Needed for 999 |
+| --- | --- | --- | --- | --- |
+| push | 506 | 46.3 | 1640.82 | ≤434 (−13%) |
+| clone | 103 | 42.0 | 266.94 | ≤71 (−29%) |
+| read | 758 | 48.2 | 2759.72 | ≤730 (−4%) |
+| write | 118 | 44.7 | 348.97 | ≤92 (−23%) |
 
 Clone is the most volatile workload across trials (94–144 ms); the rest
 are stable within a few points.

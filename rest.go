@@ -726,19 +726,22 @@ func (s *Store) restIssues(w http.ResponseWriter, r *http.Request, repo *Repo, r
 			return
 		}
 		if r.Method == http.MethodPost {
-			var raw map[string]any
-			if err := readJSONBody(r, &raw); err != nil {
+			var body struct {
+				Title  string `json:"title"`
+				Body   string `json:"body"`
+				Labels []any  `json:"labels"`
+			}
+			if err := readJSONBody(r, &body); err != nil {
 				writeErr(http.StatusBadRequest, "invalid JSON")
 				return
 			}
-			title, _ := raw["title"].(string)
-			body, _ := raw["body"].(string)
+			title, bodyText := body.Title, body.Body
 			if title == "" {
 				writeErr(http.StatusBadRequest, "title is required")
 				return
 			}
 			var labels []*Label
-			for _, ln := range parseLabelNames(raw["labels"]) {
+			for _, ln := range parseLabelNames(body.Labels) {
 				l, ok := repo.Labels[ln]
 				if !ok {
 					writeErr(422, "Validation Failed: label does not exist")
@@ -749,7 +752,7 @@ func (s *Store) restIssues(w http.ResponseWriter, r *http.Request, repo *Repo, r
 			_, now := s.tick()
 			repo.IssueSeq++
 			is := &Issue{
-				ID: s.nextID(), Number: repo.IssueSeq, Title: title, Body: body,
+				ID: s.nextID(), Number: repo.IssueSeq, Title: title, Body: bodyText,
 				State: "open", Labels: labels, CreatedAt: now, UpdatedAt: now, repo: repo,
 			}
 			if is.Labels == nil {
@@ -776,6 +779,16 @@ func (s *Store) restIssues(w http.ResponseWriter, r *http.Request, repo *Repo, r
 	}
 	if len(rest) == 1 {
 		if r.Method == http.MethodGet {
+			if is.cached != nil {
+				writeRawJSON(w, http.StatusOK, is.cached, s)
+				return
+			}
+			data, err := json.Marshal(s.issueJSON(repo, is, base))
+			if err == nil {
+				is.cached = data
+				writeRawJSON(w, http.StatusOK, data, s)
+				return
+			}
 			writeJSON(w, http.StatusOK, s.issueJSON(repo, is, base), s)
 			return
 		}
@@ -798,6 +811,7 @@ func (s *Store) restIssues(w http.ResponseWriter, r *http.Request, repo *Repo, r
 			if body.Body != nil {
 				is.Body = *body.Body
 			}
+			is.cached = nil // PATCH changes the JSON; drop the GET cache
 			_, now := s.tick()
 			is.UpdatedAt = now
 			writeJSON(w, http.StatusOK, s.issueJSON(repo, is, base), s)

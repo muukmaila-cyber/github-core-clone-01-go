@@ -9,15 +9,20 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 )
 
 // ---------------------------------------------------------------- pkt-lines
 
+const hexDigits = "0123456789abcdef"
+
 // pktLine encodes one payload (which must end with \n when it is a text line).
+// Manual hex: fmt.Sprintf("%04x") per line was a measurable cost on the
+// push/clone paths, which are pkt-line heavy.
 func pktLine(payload []byte) []byte {
 	n := len(payload) + 4
 	out := make([]byte, 0, n)
-	out = append(out, []byte(fmt.Sprintf("%04x", n))...)
+	out = append(out, hexDigits[(n>>12)&0xf], hexDigits[(n>>8)&0xf], hexDigits[(n>>4)&0xf], hexDigits[n&0xf])
 	out = append(out, payload...)
 	return out
 }
@@ -26,6 +31,31 @@ func pktString(s string) []byte { return pktLine([]byte(s)) }
 
 var pktFlush = []byte("0000")
 var pktDelim = []byte("0001")
+
+func hexVal(c byte) (int, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0'), true
+	case c >= 'a' && c <= 'f':
+		return int(c-'a'+10), true
+	case c >= 'A' && c <= 'F':
+		return int(c-'A'+10), true
+	}
+	return 0, false
+}
+
+// parseHex4 parses a 4-hex-digit pkt-line length without fmt.Sscanf.
+func parseHex4(data []byte) (int, bool) {
+	n := 0
+	for i := 0; i < 4; i++ {
+		v, ok := hexVal(data[i])
+		if !ok {
+			return 0, false
+		}
+		n = n*16 + v
+	}
+	return n, true
+}
 
 type pkt struct {
 	kind    string // "data", "flush", "delim"
@@ -36,8 +66,8 @@ type pkt struct {
 func parsePktLines(data []byte) []pkt {
 	var out []pkt
 	for len(data) >= 4 {
-		var n int
-		if _, err := fmt.Sscanf(string(data[:4]), "%04x", &n); err != nil {
+		n, ok := parseHex4(data[:4])
+		if !ok {
 			return out
 		}
 		if n == 0 {
@@ -63,8 +93,8 @@ func parsePktLines(data []byte) []pkt {
 // (a packfile) that follows the first flush.
 func splitPktBody(data []byte) (lines []pkt, tail []byte) {
 	for len(data) >= 4 {
-		var n int
-		if _, err := fmt.Sscanf(string(data[:4]), "%04x", &n); err != nil {
+		n, ok := parseHex4(data[:4])
+		if !ok {
 			return lines, data
 		}
 		if n == 0 {
@@ -86,11 +116,20 @@ func splitPktBody(data []byte) (lines []pkt, tail []byte) {
 
 // ---------------------------------------------------------------- zlib
 
+// Pooled zlib writers: buildPack compresses one object per writer, and the
+// push/clone paths build hundreds of packs per trial.
+var zlibWriterPool = sync.Pool{New: func() any {
+	w, _ := zlib.NewWriterLevel(&bytes.Buffer{}, zlib.BestSpeed)
+	return w
+}}
+
 func zlibCompress(data []byte) []byte {
 	var buf bytes.Buffer
-	w, _ := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
+	w := zlibWriterPool.Get().(*zlib.Writer)
+	w.Reset(&buf)
 	w.Write(data)
 	w.Close()
+	zlibWriterPool.Put(w)
 	return buf.Bytes()
 }
 

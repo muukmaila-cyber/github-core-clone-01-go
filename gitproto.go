@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"net/http"
 	"sort"
@@ -57,12 +58,19 @@ func (r *Repo) refEntries() []refEntry {
 }
 
 func parseTagTarget(data []byte) string {
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "object ") {
-			return strings.TrimSpace(line[7:])
+	for len(data) > 0 {
+		nl := bytes.IndexByte(data, '\n')
+		var line []byte
+		if nl < 0 {
+			line, data = data, nil
+		} else {
+			line, data = data[:nl], data[nl+1:]
 		}
-		if line == "" {
+		if len(line) == 0 {
 			break
+		}
+		if bytes.HasPrefix(line, []byte("object ")) {
+			return strings.TrimSpace(string(line[7:]))
 		}
 	}
 	return ""
@@ -443,13 +451,13 @@ func addTreeObjects(r *Repo, treeOID string, set map[string]bool) {
 	set[treeOID] = true
 	data := obj.Data
 	for len(data) > 0 {
-		sp := strings.IndexByte(string(data), ' ')
+		sp := bytes.IndexByte(data, ' ')
 		if sp < 0 {
 			return
 		}
 		mode := string(data[:sp])
 		data = data[sp+1:]
-		nul := strings.IndexByte(string(data), 0)
+		nul := bytes.IndexByte(data, 0)
 		if nul < 0 || len(data) < nul+21 {
 			return
 		}
@@ -549,7 +557,9 @@ func (s *Store) fetchResponseV0(r *Repo, req fetchRequest) []byte {
 
 // cachedPack returns the packfile for this exact fetch, building and caching it.
 // Callers must hold at least a read lock on the store (the repo objects are read).
-// The cache itself has its own mutex so concurrent clones do not serialize.
+// Concurrent identical builds are deduplicated: the first caller builds while
+// the rest wait on the in-flight call (clone fires 50 identical shallow
+// clones at once; building the same pack 50x on 1.5 CPUs was pure waste).
 func (s *Store) cachedPack(r *Repo, req fetchRequest, oids []string) []byte {
 	key := r.Owner + "/" + r.Name + "|" + strings.Join(req.wants, ",") + "|" +
 		strings.Join(req.haves, ",") + "|" + strings.Join(req.shallow, ",") + "|" +
@@ -560,13 +570,27 @@ func (s *Store) cachedPack(r *Repo, req fetchRequest, oids []string) []byte {
 		return pack
 	}
 	s.packCacheMu.Unlock()
+	s.packFlightMu.Lock()
+	if call, ok := s.packFlight[key]; ok {
+		s.packFlightMu.Unlock()
+		<-call.done
+		return call.pack
+	}
+	call := &packCall{done: make(chan struct{})}
+	s.packFlight[key] = call
+	s.packFlightMu.Unlock()
 	pack := buildPack(r.Objects, oids)
+	call.pack = pack
 	s.packCacheMu.Lock()
 	if len(s.packCache) > 16 {
 		s.packCache = make(map[string][]byte)
 	}
 	s.packCache[key] = pack
 	s.packCacheMu.Unlock()
+	s.packFlightMu.Lock()
+	delete(s.packFlight, key)
+	s.packFlightMu.Unlock()
+	close(call.done)
 	return pack
 }
 
