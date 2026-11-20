@@ -16,6 +16,8 @@ byte-for-byte, 0 nondeterministic, 0 timeout.
 | E | 20 Nov ~23:12 | iterasi 1: Sscanf→hex manual, pktLine manual, isAncestor DFS, parse byte-based, pack singleflight, issue-JSON cache, auth precompute, zlib writer pool | 983 | 981 | 980 | 981.3 | 181.3 | 259.9 µs |
 | F | 20 Nov ~23:18 | iterasi 2: GOMAXPROCS=2 + GC off | 977 | 976 | 975 | 976.0 | 176.0 | 282.5 µs |
 | G | 20 Nov ~23:20 | iterasi 2 REVERTED (= E) | 980 | 978 | 985 | 981.0 | 181.0 | 261.7 µs |
+| H | 20 Nov ~23:27 | iterasi 3a: `-gcflags=all=-B` (matikan bounds check) | 981 | 974 | 980 | 978.3 | 178.3 | 273.3 µs |
+| I | 20 Nov ~23:29 | iterasi 3 REVERTED (= E/G, binary commit) | 966 | 979 | 982 | 975.7 | 175.7 | 284.8 µs |
 
 ## What the numbers say
 
@@ -50,6 +52,18 @@ byte-for-byte, 0 nondeterministic, 0 timeout.
   band (980/978/985, best single trial 985). E+G combined mean: **981.2**
   (perf 181.2, p50 ~261 µs). Trial-to-trial noise is ±3 points
   (978–985); clone is the most volatile workload (rounds 89–172 ms).
+- **Iterasi 3a (flag compiler `-gcflags=all=-B`):** run H 978.3
+  (981/974/980), perf 178.3 — NO gain vs E/G 981.2, dalam noise.
+  Push sempat 50 poin (418,5 ms, trial 0) tapi clone/read turun;
+  host juga melambat saat run H (grade 94 dtk vs ~60 dtk biasa).
+  Di-revert; run I (binary commit, plain flags) 975.7 (966/979/982)
+  dengan trial 0 clone 230,9 ms (outlier, load VM 1,81 di awal run).
+  Trials 1–2 run I: 979/982 — kembali di band E/G.
+  **Plafon terkonfirmasi: 12 trial (E, G, H, I) semua di 966–985,
+  mean ~978–981.** Yang sengaja TIDAK dicoba: `GOAMD64=v3` (binary
+  butuh AVX2 — CPU server tidak diketahui, risiko illegal-instruction
+  crash = skor 0, untuk gain yang tak terukur) dan pooled zlib readers
+  (~1 ms per trial, 0,2% — di bawah noise ±3 poin).
 
 ## Why 999 is blocked (measured, 20 Nov ~23:20 WIB)
 
