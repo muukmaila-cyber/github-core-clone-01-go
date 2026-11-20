@@ -1,4 +1,10 @@
-# github-core-clone-01 — Go forge (v0.3.0-go)
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/muukmaila-cyber/github-core-clone-01-go/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/muukmaila-cyber/github-core-clone-01-go/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+Built for the [make.fun github-core-clone-01 bounty](https://make.fun/bounty/github-core-clone-01) — a GitHub-compatible git forge, $500 in USDC.
+
+# github-core-clone-01 — Go forge (v0.3.1-go)
 
 A GitHub-compatible git forge written from scratch in Go (standard library
 only), built as one statically linked Linux amd64 binary and launched from
