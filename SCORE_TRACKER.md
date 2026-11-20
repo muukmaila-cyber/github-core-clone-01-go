@@ -18,6 +18,7 @@ byte-for-byte, 0 nondeterministic, 0 timeout.
 | G | 20 Nov ~23:20 | iterasi 2 REVERTED (= E) | 980 | 978 | 985 | 981.0 | 181.0 | 261.7 µs |
 | H | 20 Nov ~23:27 | iterasi 3a: `-gcflags=all=-B` (matikan bounds check) | 981 | 974 | 980 | 978.3 | 178.3 | 273.3 µs |
 | I | 20 Nov ~23:29 | iterasi 3 REVERTED (= E/G, binary commit) | 966 | 979 | 982 | 975.7 | 175.7 | 284.8 µs |
+| J | 20 Nov ~23:34 | iterasi 4: pooled zlib readers (sync.Pool + Reset di parsePack) | 971 | 974 | 981 | 975.3 | 175.3 | 284.4 µs |
 
 ## What the numbers say
 
@@ -64,6 +65,15 @@ byte-for-byte, 0 nondeterministic, 0 timeout.
   butuh AVX2 — CPU server tidak diketahui, risiko illegal-instruction
   crash = skor 0, untuk gain yang tak terukur) dan pooled zlib readers
   (~1 ms per trial, 0,2% — di bawah noise ±3 poin).
+- **Iterasi 4 (pooled zlib readers, atas pilihan user):** run J 975.3
+  (971/974/981), perf 175.3. Push 506 → 479 ms (+1 poin, satu-satunya
+  workload yang disentuh parsePack) — tapi push di run H/I (binary
+  commit, tanpa pool) juga 484/446 ms: perbaikan push adalah varians
+  host, bukan efek pool. Clone/read/write (tidak disentuh) justru
+  turun karena host melambat — total run di bawah baseline E/G 981,2.
+  Kesimpulan: gain tak terbukti → **DI-REVERT**, kode kembali ke
+  v0.3.1-go commit f096d8e (binary sama). 15 trial total (E–J):
+  plafon **~975–981**.
 
 ## Why 999 is blocked (measured, 20 Nov ~23:20 WIB)
 
